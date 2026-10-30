@@ -1346,11 +1346,5 @@ DefineList PathTracer::StaticParams::getDefines(const PathTracer& owner) const
     defines.add("OUTPUT_NRD_DATA", "0");
     defines.add("OUTPUT_NRD_ADDITIONAL_DATA", "0");
 
-    // [Adaptive] Propagate feature-flag macros derived from ADAPTIVE_VERSION to all shaders.
-    // The source-of-truth is the macro block at the bottom of PathTracer.h.
-    defines.add("USE_IDEA_AB", USE_IDEA_AB ? "1" : "0");
-    defines.add("USE_IDEA_C", USE_IDEA_C ? "1" : "0");
-    defines.add("USE_IDEA_DE", USE_IDEA_DE ? "1" : "0");
-
     return defines;
 }
