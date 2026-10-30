@@ -33,3 +33,7 @@
 *.tlog
 *.bak
 *.swp
+
+# Claude
+/.claude
+CLAUDE.md
