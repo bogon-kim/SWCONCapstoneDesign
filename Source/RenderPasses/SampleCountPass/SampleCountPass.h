@@ -1,30 +1,28 @@
 /***************************************************************************
- # SampleCountPass.h
+ # SampleCountPass.h  (spec_TSK.md R-5.5)
  #
+ # 배분 규칙 (SppAllocation.h 와 같다):
+ #   B     = sTarget · 픽셀 수                      전체 예산
+ #   w_p   = ε + I_p                                가중치
+ #   x_p   = clamp(s · w_p, 1, maxSpp)              Σ x_p = B 가 되도록 s 를 정한다
+ #   spp_p = clamp(floor(x_p) + δ_p, 1, maxSpp)     Σ spp_p = B (가능한 범위일 때)
  #
- # 알고리즘:
- #   S_p = clamp(round(I_p / Avg_Imp * sTarget), 1, maxSamples)
- #
- # GPU Reduction 구조 (3-pass dispatch):
- #   reduceMain   : 16×16 타일별 부분합 → gTilePartialSums 버퍼
- #   finalizeMain : 부분합 합산 → gAvgImpBuf[0] = Avg_Imp
- #   main         : 픽셀별 sampleCount 계산 + sampleCountVis 기록
- #
- # [디버그 출력]
- # sampleCountVis 채널: 픽셀별 sample count 를 (count/maxSamples) 로 정규화한
- # RGBA8Unorm 텍스처로 시각화하여 RenderGraph output 으로 노출.
+ # GPU 구성 (5 dispatch, SampleCountPass.cs.slang):
+ #   histMain / solveMain / baseMain / deltaMain / finalMain
+ # [디버그 출력] sampleCountVis: spp 를 파랑(1) → 빨강(maxSpp) 으로 보여 준다.
  **************************************************************************/
 #pragma once
 #include "Falcor.h"
 #include "RenderGraph/RenderPass.h"
 #include "RenderGraph/RenderPassHelpers.h"
+#include "SppAllocation.h"
 using namespace Falcor;
 
 class SampleCountPass : public RenderPass
 {
 public:
     FALCOR_PLUGIN_CLASS(SampleCountPass, "SampleCountPass",
-        "Outputs per-pixel sample count using average-importance-based distribution.");
+        "Outputs per-pixel sample count: total budget B distributed by importance (R-5.5).");
 
     static ref<SampleCountPass> create(ref<Device> pDevice, const Properties& props)
     {
@@ -33,50 +31,39 @@ public:
 
     SampleCountPass(ref<Device> pDevice, const Properties& props);
 
-    // -----------------------------------------------------------------------
-    // RenderPass interface
-    // -----------------------------------------------------------------------
-    virtual Properties          getProperties()  const override;
+    virtual Properties           getProperties()  const override;
     virtual RenderPassReflection reflect(const CompileData& compileData) override;
-    virtual void                execute(RenderContext* pRenderContext, const RenderData& renderData) override;
-    virtual void                renderUI(Gui::Widgets& widget) override;
+    virtual void                 execute(RenderContext* pRenderContext, const RenderData& renderData) override;
+    virtual void                 renderUI(Gui::Widgets& widget) override;
 
 private:
     void parseProperties(const Properties& props);
 
-    /// GPU reduction 버퍼를 해상도에 맞게 (재)생성한다.
-    /// 해상도가 바뀌거나 처음 execute() 가 호출될 때 호출된다.
-    void prepareBuffers(uint32_t width, uint32_t height);
+    // 상수 버퍼 (SampleCountPass.cs.slang 의 CB 와 같아야 한다)
+    struct alignas(16) SppCB
+    {
+        uint32_t frameDim[2];  //  0
+        uint32_t budget;       //  8
+        uint32_t maxSpp;       // 12
+        float    epsilon;      // 16
+        float    wMax;         // 20
+        uint32_t _p0, _p1;     // 24, 28
+    };  // 32 bytes
 
-    // -----------------------------------------------------------------------
-    // Configuration (exposed as properties / UI)
-    // -----------------------------------------------------------------------
+    // 설정 (속성·UI)
+    uint32_t mSTarget    = 4u;    ///< 평균 spp. 예산 B = mSTarget · 픽셀 수
+    uint32_t mMaxSamples = 16u;   ///< 픽셀당 최대 spp
+    float    mEpsilon    = 0.1f;  ///< ε: 가중치 바닥값
 
-    /// 목표 평균 spp.  Avg_Imp 픽셀의 샘플 수가 이 값이 되도록 스케일한다.
-    uint32_t mSTarget    = 4u;
+    // 5 개의 compute 패스 (같은 셰이더 파일, 진입점만 다르다)
+    ref<ComputePass> mpHistPass;
+    ref<ComputePass> mpSolvePass;
+    ref<ComputePass> mpBasePass;
+    ref<ComputePass> mpDeltaPass;
+    ref<ComputePass> mpFinalPass;
 
-    /// 픽셀당 최대 spp.  PathTracer 가 처리 가능한 상한.
-    uint32_t mMaxSamples = 16u;
-
-    // -----------------------------------------------------------------------
-    // GPU resources
-    // -----------------------------------------------------------------------
-
-    /// Pass 1: 타일별 부분합 커널 (reduceMain 진입점).
-    ref<ComputePass> mpReducePass;
-
-    /// Pass 2: 전체 합산 → Avg_Imp 커널 (finalizeMain 진입점).
-    ref<ComputePass> mpFinalizePass;
-
-    /// Pass 3: 픽셀별 샘플 수 계산 커널 (main 진입점).
-    ref<ComputePass> mpComputePass;
-
-    /// Pass 1 → Pass 2: 타일별 부분합 저장 버퍼 (float × numTiles).
-    ref<Buffer> mpTilePartialSums;
-
-    /// Pass 2 결과: Avg_Imp 저장 버퍼 (float × 1).
-    ref<Buffer> mpAvgImpBuf;
-
-    /// 마지막으로 버퍼를 생성했을 때의 해상도 (변경 감지용).
-    uint2 mLastFrameDim = {0u, 0u};
+    // 공유 버퍼
+    ref<Buffer> mpHist;   ///< uint × HIST_SIZE (가중치·소수 부분 히스토그램, Σbase)
+    ref<Buffer> mpScale;  ///< float × 1 (s)
+    ref<Buffer> mpDelta;  ///< int × 4 (mode, thr, rem, ticket)
 };

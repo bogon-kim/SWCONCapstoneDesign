@@ -1,159 +1,231 @@
 /***************************************************************************
- # SampleCountPass.cs.slang
+ # SampleCountPass.cs.slang  (spec_TSK.md R-5.5)
  #
- # 알고리즘:
- #   1. reduceMain  : 타일(16×16)별 importance 부분합을 gTilePartialSums 에 기록.
- #   2. finalizeMain: 부분합 전체를 합산하여 Avg_Imp 를 gAvgImpBuf[0] 에 기록.
- #   3. main        : S_p = clamp(round(I_p / Avg_Imp * S_target), 1, maxSamples)
+ # 픽셀별 spp 배분. SppAllocation.cpp 와 같은 알고리즘이다.
+ #   w_p   = ε + I_p
+ #   x_p   = clamp(s · w_p, 1, maxSpp),  s 는 Σ x_p = B 가 되도록 정한다
+ #   spp_p = clamp(floor(x_p) + δ_p, 1, maxSpp),  Σ δ_p = B − Σ floor(x_p)
  #
- # [디버그 시각화]
- # gSampleCountVis: sample count 를 (count / maxSamples) 로 정규화한 RGBA8Unorm 출력.
- # HAS_SAMPLE_COUNT_VIS 가 1 일 때만 기록한다.
- **************************************************************************/
-
-// ---- guard defines (C++ 측에서 addDefine 으로 주입됨) -------------------
+ # [5 단계 dispatch]
+ #   1. histMain  : w 의 히스토그램 (W_BINS 개)
+ #   2. solveMain : s 를 이분법으로 구한다 (1 스레드)
+ #   3. baseMain  : base = floor(x), Σbase, 소수 부분 히스토그램 (+1 가능 / −1 가능)
+ #   4. deltaMain : L = B − Σbase 를 어느 소수 bin 까지 ±1 할지 정한다 (1 스레드)
+ #   5. finalMain : spp = base + δ 를 쓴다. 같은 bin 의 픽셀 중 몇 개만 ±1 할지는 atomic 카운터로 고른다
+ ***************************************************************************/
 #ifndef HAS_SAMPLE_COUNT_VIS
 #define HAS_SAMPLE_COUNT_VIS 0
 #endif
 
-// =========================================================================
-// Constant buffer  
-// =========================================================================
+#define W_BINS      1024
+#define F_BINS      256
+#define BISECT_ITERS 32
+#define HIST_ADD    W_BINS                 // +1 가능 픽셀의 소수 bin
+#define HIST_SUB    (W_BINS + F_BINS)      // −1 가능 픽셀의 소수 bin
+#define HIST_SUMBASE (W_BINS + 2 * F_BINS) // Σ base
+#define HIST_SIZE   (W_BINS + 2 * F_BINS + 1)
+
 cbuffer CB
 {
-    uint2  frameDim;    ///< 렌더 해상도 (픽셀 단위)
-    uint   sTarget;     ///< 목표 평균 spp  (예: 4)
-    uint   maxSamples;  ///< 픽셀당 최대 spp (예: 16)
-    uint   numTiles;    ///< 타일 총 개수 = ceil(W/16) * ceil(H/16)  (finalizeMain 전용)
-    uint   totalPixels; ///< 전체 픽셀 수 = W * H                    (finalizeMain 전용)
+    uint2  frameDim;   // 해상도
+    uint   budget;     // B = sTarget · 픽셀 수
+    uint   maxSpp;     // 픽셀당 최대 spp (16)
+    float  epsilon;    // ε
+    float  wMax;       // 1 + ε (가중치 최대값, 히스토그램 범위)
+    uint   _p0;
+    uint   _p1;
 };
 
-// =========================================================================
-// Resources
-// =========================================================================
+Texture2D<float>    gImportance;     // I_p (ImportancePass 출력)
+RWTexture2D<uint>   gOutput;         // spp (R8Uint). baseMain 에서 base 를 먼저 쓰고 finalMain 에서 고친다
+RWTexture2D<float4> gSampleCountVis; // 시각화 (HAS_SAMPLE_COUNT_VIS 일 때만 쓴다)
+RWStructuredBuffer<uint> gHist;      // HIST_SIZE 개. 매 프레임 0 으로 지운다
+RWStructuredBuffer<float> gScale;    // [0] = s
+RWStructuredBuffer<int>   gDelta;    // [0] mode(+1,−1,0)  [1] thr  [2] rem  [3] ticket (매 프레임 0)
 
-/// importance 입력 (ImportancePass 출력, R32Float).
-Texture2D<float>    gImportance;
-
-/// Pass 1 → Pass 2 용 타일별 부분합 버퍼 (RWStructuredBuffer<float>).
-/// 크기 = numTiles (C++ 에서 할당).
-RWStructuredBuffer<float> gTilePartialSums;
-
-/// Pass 2 결과 : gAvgImpBuf[0] = Avg_Imp (float).
-RWStructuredBuffer<float> gAvgImpBuf;
-
-/// 실제 sample count 출력 (R8Uint) — PathTracer 가 Texture2D<uint> 로 읽는다.
-RWTexture2D<uint>   gOutput;
-
-/// [디버그 시각화] 정규화된 sample count 를 RGBA8Unorm 으로 기록.
-RWTexture2D<float4> gSampleCountVis;
-
-// =========================================================================
-// Pass 1 : 타일별 부분합  (reduceMain)
-// =========================================================================
-// 그룹 크기 16×16 = 256 스레드.
-// 각 그룹이 자신의 타일에 속하는 픽셀들의 importance 합을 계산한 뒤,
-// gTilePartialSums[groupLinearId] 에 기록한다.
-// =========================================================================
-
-groupshared float gs_partialSum[256]; ///< 그룹 공유 메모리 (16×16 스레드)
-
-[numthreads(16, 16, 1)]
-void reduceMain(
-    uint3 dispatchThreadId : SV_DispatchThreadID,
-    uint3 groupId          : SV_GroupID,
-    uint  groupIndex       : SV_GroupIndex)   // 0..255
+uint weightBin(float w)
 {
-    // ---- 픽셀 importance 읽기 ----
-    uint2 pixel = dispatchThreadId.xy;
-    float val = 0.f;
-    if (all(pixel < frameDim))
-        val = gImportance[pixel];  // 범위 밖 픽셀은 0 으로 처리 (평균에 영향 최소화)
-
-    gs_partialSum[groupIndex] = val;
-    GroupMemoryBarrierWithGroupSync();
-
-    // ---- 공유 메모리 내 parallel reduction (256→1) ----
-    // 2의 거듭제곱 stride 로 절반씩 합산한다.
-    [unroll]
-    for (uint stride = 128u; stride >= 1u; stride >>= 1u)
-    {
-        if (groupIndex < stride)
-            gs_partialSum[groupIndex] += gs_partialSum[groupIndex + stride];
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    // ---- 그룹 대표 스레드가 부분합을 전역 버퍼에 기록 ----
-    if (groupIndex == 0u)
-    {
-        // 타일 인덱스 = groupId.y * 타일수_X + groupId.x
-        // 타일수_X = ceil(frameDim.x / 16)
-        uint tilesX = (frameDim.x + 15u) / 16u;
-        uint tileIdx = groupId.y * tilesX + groupId.x;
-        gTilePartialSums[tileIdx] = gs_partialSum[0];
-    }
+    float t = w / wMax * float(W_BINS);
+    return min(uint(max(t, 0.f)), uint(W_BINS - 1));
 }
 
-// =========================================================================
-// Pass 2 : 전체 합산 → Avg_Imp 계산  (finalizeMain)
-// =========================================================================
-// 단일 그룹 1×1×1 로 dispatch 하여 모든 타일 부분합을 CPU 없이 합산한다.
-// 단, numTiles 가 크면 루프가 길어진다(성능 트레이드오프).
-// 일반적인 1080p(120×68 = 8160 타일) 정도에서는 허용 가능.
-// =========================================================================
+uint fracBin(float f)
+{
+    return min(uint(max(f * float(F_BINS), 0.f)), uint(F_BINS - 1));
+}
+
+float weightOf(uint2 p)
+{
+    return epsilon + saturate(gImportance[p]);
+}
+
+// ---- 1. 가중치 히스토그램 -------------------------------------------------
+[numthreads(16, 16, 1)]
+void histMain(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 p = dispatchThreadId.xy;
+    if (any(p >= frameDim)) return;
+    InterlockedAdd(gHist[weightBin(weightOf(p))], 1u);
+}
+
+// ---- 2. s 찾기 -------------------------------------------------------------
+// F(s) = Σ count_b · clamp(s · rep_b, 1, maxSpp)  (rep_b 는 bin 중심)
+float evalF(float sc)
+{
+    float sum = 0.f;
+    for (uint b = 0u; b < uint(W_BINS); b++)
+    {
+        uint c = gHist[b];
+        if (c == 0u) continue;
+        float rep = (float(b) + 0.5f) / float(W_BINS) * wMax;
+        sum += float(c) * clamp(sc * rep, 1.f, float(maxSpp));
+    }
+    return sum;
+}
 
 [numthreads(1, 1, 1)]
-void finalizeMain(uint3 dispatchThreadId : SV_DispatchThreadID)
+void solveMain()
 {
-    float total = 0.f;
-    for (uint i = 0u; i < numTiles; i++)
-        total += gTilePartialSums[i];
-
-    // 실제 픽셀 수로 나눠 평균 계산 (타일이 프레임 경계를 넘어 패딩된 부분은 이미 0).
-    float avgImp = (totalPixels > 0u) ? (total / float(totalPixels)) : 1.f;
-
-    // Avg_Imp 가 0 에 가까우면 나눗셈 오버플로 방지를 위해 최솟값을 보장한다.
-    gAvgImpBuf[0] = max(avgImp, 1e-4f);
+    uint n = frameDim.x * frameDim.y;
+    float s;
+    if (budget <= n)
+    {
+        s = 0.f;                                   // 예산이 최소치 이하: 전부 1 spp
+    }
+    else if (budget >= n * maxSpp)
+    {
+        s = float(maxSpp) / epsilon * 2.f;         // 예산이 최대치 이상: 전부 maxSpp
+    }
+    else
+    {
+        float lo = 0.f;
+        float hi = float(maxSpp) / epsilon;        // F(hi) = maxSpp · n ≥ B
+        for (uint it = 0u; it < uint(BISECT_ITERS); it++)
+        {
+            float mid = 0.5f * (lo + hi);
+            if (evalF(mid) < float(budget)) lo = mid;
+            else                            hi = mid;
+        }
+        s = hi;
+    }
+    gScale[0] = s;
 }
 
-// =========================================================================
-// Pass 3 : 픽셀별 샘플 수 계산  (main)
-// =========================================================================
-
+// ---- 3. 정수 부분과 소수 부분 히스토그램 -----------------------------------
 [numthreads(16, 16, 1)]
-void main(uint3 dispatchThreadId : SV_DispatchThreadID)
+void baseMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
-    uint2 pixel = dispatchThreadId.xy;
-    if (any(pixel >= frameDim))
-        return;
+    uint2 p = dispatchThreadId.xy;
+    if (any(p >= frameDim)) return;
 
-    // ---- Avg_Imp 읽기 (Pass 2 에서 기록한 값) ----
-    float avgImp = gAvgImpBuf[0];  // max(avg, 1e-4) 보장됨
+    float x = clamp(gScale[0] * weightOf(p), 1.f, float(maxSpp));
+    uint base = uint(floor(x));
+    gOutput[p] = base;
+    InterlockedAdd(gHist[HIST_SUMBASE], base);
 
-    // ---- 픽셀 importance ----
-    float imp = gImportance[pixel];
+    uint fb = fracBin(x - float(base));
+    if (base < maxSpp) InterlockedAdd(gHist[HIST_ADD + fb], 1u);   // +1 을 받을 수 있다
+    if (base > 1u)     InterlockedAdd(gHist[HIST_SUB + fb], 1u);   // −1 을 받을 수 있다
+}
 
-    // ---- S_p = clamp( round(I_p / Avg_Imp * S_target), 1, maxSamples ) ----
-    // round() 는 nearest-integer 반올림이다.
-    // sTarget 과 maxSamples 는 uint 이므로 float 캐스팅 후 계산한다.
-    float rawCount = (imp / avgImp) * float(sTarget);
-    uint  count    = clamp(uint(round(rawCount)), 1u, maxSamples);
+// ---- 4. 보정 기준 정하기 (1 스레드) ----------------------------------------
+[numthreads(1, 1, 1)]
+void deltaMain()
+{
+    int L = int(budget) - int(gHist[HIST_SUMBASE]);
+    int mode = 0;
+    int thr = 0;
+    int rem = 0;
+    if (L > 0)
+    {
+        // 소수 부분이 큰 쪽부터 +1. 가능한 픽셀이 부족하면 thr = −1 (전부 +1)
+        mode = 1;
+        thr = -1;
+        int cum = 0;
+        for (int t = F_BINS - 1; t >= 0; t--)
+        {
+            int c = int(gHist[HIST_ADD + uint(t)]);
+            if (cum + c >= L)
+            {
+                thr = t;
+                rem = L - cum;
+                break;
+            }
+            cum += c;
+        }
+    }
+    else if (L < 0)
+    {
+        // 소수 부분이 작은 쪽부터 −1. 가능한 픽셀이 부족하면 thr = F_BINS (전부 −1)
+        mode = -1;
+        int need = -L;
+        int cum = 0;
+        thr = F_BINS;
+        for (int t = 0; t < F_BINS; t++)
+        {
+            int c = int(gHist[HIST_SUB + uint(t)]);
+            if (cum + c >= need)
+            {
+                thr = t;
+                rem = need - cum;
+                break;
+            }
+            cum += c;
+        }
+    }
+    gDelta[0] = mode;
+    gDelta[1] = thr;
+    gDelta[2] = rem;
+    gDelta[3] = 0;
+}
 
-    // 실제 sample count 기록 (R8Uint — PathTracer 가 읽음).
-    gOutput[pixel] = count;
+// ---- 5. 최종 spp ------------------------------------------------------------
+[numthreads(16, 16, 1)]
+void finalMain(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 p = dispatchThreadId.xy;
+    if (any(p >= frameDim)) return;
 
-    // [디버그 시각화] 절대 sample count 를 히트맵으로 표현한다.
-    //   1spp → 파랑, 16spp → 빨강. 중간은 파랑→시안→초록→노랑→빨강 다단계 보간.
-    //   직접 파랑→빨강을 보간하면 중간값이 보라가 되므로, 초록·노랑을 거치도록 한다.
-    //   t = (count - 1) / 15  :  1spp → 0.0,  16spp → 1.0
+    int base = int(gOutput[p]);
+    float x = clamp(gScale[0] * weightOf(p), 1.f, float(maxSpp));
+    int fb = int(fracBin(x - floor(x)));
+
+    int mode = gDelta[0];
+    int thr = gDelta[1];
+    int rem = gDelta[2];
+    int v = base;
+    if (mode > 0 && base < int(maxSpp))
+    {
+        if (fb > thr) v += 1;
+        else if (fb == thr)
+        {
+            int ticket;
+            InterlockedAdd(gDelta[3], 1, ticket);
+            if (ticket < rem) v += 1;
+        }
+    }
+    else if (mode < 0 && base > 1)
+    {
+        if (fb < thr) v -= 1;
+        else if (fb == thr)
+        {
+            int ticket;
+            InterlockedAdd(gDelta[3], 1, ticket);
+            if (ticket < rem) v -= 1;
+        }
+    }
+    v = clamp(v, 1, int(maxSpp));
+    gOutput[p] = uint(v);
+
+    // [디버그 시각화] 1spp → 파랑, 16spp → 빨강 (파랑→시안→초록→노랑→빨강)
 #if HAS_SAMPLE_COUNT_VIS
-    float t = saturate(float(count - 1u) / 15.f);
-    float u = t * 4.f;  // [0,1] 을 4개 구간으로 분할
+    float t = saturate(float(v - 1) / 15.f);
+    float u = t * 4.f;
     float3 heatCol;
-    if      (u < 1.f) heatCol = lerp(float3(0,0,1), float3(0,1,1), u);        // 파랑 → 시안
-    else if (u < 2.f) heatCol = lerp(float3(0,1,1), float3(0,1,0), u - 1.f);  // 시안 → 초록
-    else if (u < 3.f) heatCol = lerp(float3(0,1,0), float3(1,1,0), u - 2.f);  // 초록 → 노랑
-    else              heatCol = lerp(float3(1,1,0), float3(1,0,0), u - 3.f);  // 노랑 → 빨강
-    gSampleCountVis[pixel] = float4(heatCol, 1.f);
+    if      (u < 1.f) heatCol = lerp(float3(0,0,1), float3(0,1,1), u);
+    else if (u < 2.f) heatCol = lerp(float3(0,1,1), float3(0,1,0), u - 1.f);
+    else if (u < 3.f) heatCol = lerp(float3(0,1,0), float3(1,1,0), u - 2.f);
+    else              heatCol = lerp(float3(1,1,0), float3(1,0,0), u - 3.f);
+    gSampleCountVis[p] = float4(heatCol, 1.f);
 #endif
 }

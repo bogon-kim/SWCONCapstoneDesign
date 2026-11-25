@@ -2,6 +2,7 @@
  # ImportancePass.cs.slang
  # 1단계: max(albedoVar, geoNormVar, detailNormVar, metalness, glossiness)
  # 2단계: task override -> center weight -> luminance penalty -> motion penalty
+ # 적 마스크 통계: 붉은색 알베도 픽셀 수·좌표 합·조준점 적중 (CPU 비동기 readback 용)
  ***************************************************************************/
 #ifndef HAS_DIFFUSE_OPACITY
 #define HAS_DIFFUSE_OPACITY 0
@@ -24,9 +25,6 @@
 #ifndef HAS_SHADOW_COUNT
 #define HAS_SHADOW_COUNT 0
 #endif
-#ifndef HAS_OBJ_ID
-#define HAS_OBJ_ID 0
-#endif
 #ifndef HAS_LUMINANCE
 #define HAS_LUMINANCE 0
 #endif
@@ -44,7 +42,7 @@ cbuffer CB
 {
     uint2  frameDim;
     float2 invFrameDim;
-    uint   activeTask;          // 0:None 1:Aim 2:Point 3:Steer
+    uint   activeTask;          // 0:Hold 1:Scan 2:Traverse 3:Track 4:Flick
     uint   debugView;           // 0:Imp 1:TaskOverlay 2:ImgOnly 3:TaskOnly
     uint   hasImportanceVis;
     uint   _pad0;
@@ -52,17 +50,29 @@ cbuffer CB
     float  centerRadiusUV;
     float  taskImportance;
     float  enemyRedThreshold;
-    float  itemGBThreshold;
+    float  enemyRedDominance;
     float  lumLow;
     float  lumHigh;
     float  motionA;
     float  motionB;
     float  motionC;
     float  centerWeightMin;
-    float  steerFloorY;
-    float  _pad1;
+    float  pathHalfWidthUV;     // Traverse 경로 반너비 (높이 단위)
+    float  enemyGreenMaxRatio;
     float  _pad2;
     float  _pad3;
+    float4 enemyBBox;           // 96: 적 바운딩 박스 x0 y0 x1 y1 (UV, 최근 readback)
+    float2 enemyCentroidUV;     // 112: 적 중심 (UV, 평활화 후)
+    uint   enemyValid;          // 120: 적이 가시이면 1
+    uint   identifyMode;        // 124: 0 태그 기반, 1 색상 기반 (비교용)
+    float  scanDirX;            // 128: 회전 방향 -1..+1
+    float  bandHalfHeightUV;    // 132: Scan 띠 반높이 (높이 단위)
+    float  corridorHalfWidthUV; // 136: Flick 회랑 반너비 (높이 단위)
+    uint   instanceCount;       // 140: 태그 표 항목 수 (TagPass 용)
+    float  enemyAlpha;          // 144: R-5.4 α (램프 적용 값)
+    float  _pad4;
+    float  _pad5;
+    float  _pad6;
 };
 
 Texture2D<float4> gDiffuseOpacity;
@@ -72,14 +82,18 @@ Texture2D<float4> gSpecRough;
 Texture2D<float4> gMotionVectorW;
 Texture2D<float4> gLinearZ;
 Texture2D<uint>   gShadowCount;
-Texture2D<uint>   gObjectID;
+Texture2D<uint>   gTagIn;       // 태그 맵 (TagPass 출력, R-2.3)
+Texture2D<float>  gEnemyRoi;    // 적 영역 맵 I_enemy (EnemyField 출력, R-5.2)
 Texture2D<float>  gLuminanceTex;
 Texture2D<float>  gCenterDist;
 Texture2D<float>  gMetalness;
 
 RWTexture2D<float>  gImportance;
 RWTexture2D<float4> gImportanceVis;
-RWStructuredBuffer<uint> gCenterCategory; // 1 element: 0/1/2
+// [0] 적 픽셀 수 [1] x 좌표 합 [2] y 좌표 합 [3] 조준점 픽셀이 적이면 1
+// [4] 적 x 최대 [5] 적 y 최대 [6] (W - x) 최대 [7] (H - y) 최대 -> 바운딩 박스 (x 최소 = W - [6])
+// 좌표 합은 uint32 라서 적 픽셀이 약 200만 개(1080p 전체)를 넘으면 넘칠 수 있다.
+RWStructuredBuffer<uint> gEnemyStats;
 
 // ---------- helpers ----------
 int2 clampP(int2 p)
@@ -216,20 +230,6 @@ float normalVar3x3(int2 p, bool useGuide)
     return saturate(acc / 8.f);
 }
 
-// task-aware overlay color heuristic (per pixel, GPU side)
-bool isEnemyColor(float3 c)
-{
-    float maxC = max(c.r, max(c.g, c.b)) + 1e-6f;
-    return (c.r > enemyRedThreshold) && ((c.r / maxC) > 0.9f) && (c.g < (c.r * 0.4f));
-}
-
-bool isItemColor(float3 c)
-{
-    float maxC = max(c.r, max(c.g, c.b)) + 1e-6f;
-    bool greenDom = (c.g > itemGBThreshold) && ((c.g / maxC) > 0.9f) && (c.r < (c.g * 0.4f));
-    bool blueDom  = (c.b > itemGBThreshold) && ((c.b / maxC) > 0.9f) && (c.r < (c.b * 0.4f));
-    return greenDom || blueDom;
-}
 
 // [히트맵] 스칼라 값 t ∈ [0,1] 을 파랑→초록→빨강 으로 매핑한다.
 float3 heatmap(float t)
@@ -240,24 +240,102 @@ float3 heatmap(float t)
         : lerp(float3(0.f, 1.f, 0.f), float3(1.f, 0.f, 0.f), t * 2.f - 1.f); // 초록 → 빨강
 }
 
+// task 별 ROI 판정 (R-5.1). TaskRoi.cpp 의 inTaskRoi() 와 같은 식이어야 한다.
+// 원·타원·회랑은 종횡비를 반영해 높이 단위로 계산한다. 바운딩 박스만 UV 단위다.
+bool inTaskRoi(float2 uv, uint tag)
+{
+    float aspect = float(frameDim.x) / float(frameDim.y);
+    float2 q = float2(uv.x * aspect, uv.y);
+    float2 c = float2(centerUV.x * aspect, centerUV.y);
+    float2 dc = q - c;
+    bool inCircle = length(dc) <= centerRadiusUV;
+
+    if (activeTask == 0u) return inCircle; // Hold
+    if (activeTask == 1u)                  // Scan: 회전 방향으로 치우친 수평 타원
+    {
+        float ecx = (0.5f + 0.25f * scanDirX) * aspect;
+        float2 d = (q - float2(ecx, 0.5f)) / float2(0.5f * aspect, bandHalfHeightUV);
+        return dot(d, d) <= 1.f;
+    }
+    if (activeTask == 2u)                  // Traverse: 중심 원 + 경로 위 Wall / Floor
+    {
+        if (inCircle) return true;
+        bool onPath = abs(q.x - 0.5f * aspect) <= pathHalfWidthUV;
+        return onPath && (tag == 3u || tag == 4u);
+    }
+
+    // Track / Flick: 적이 가시일 때만
+    if (enemyValid == 0u) return false;
+    bool inBox = all(uv >= enemyBBox.xy) && all(uv <= enemyBBox.zw);
+    if (inBox) return true;
+    if (activeTask != 4u) return false;    // Track 은 박스만
+
+    // Flick: 조준점 -> 적 중심 선분에서 반너비 이내 (선분 끝을 넘지 않는다)
+    float2 b = float2(enemyCentroidUV.x * aspect, enemyCentroidUV.y);
+    float2 ab = b - c;
+    float len2 = dot(ab, ab);
+    float t = (len2 > 1e-12f) ? saturate(dot(q - c, ab) / len2) : 0.f;
+    return length(q - (c + t * ab)) <= corridorHalfWidthUV;
+}
+
+// 그룹 단위 적 마스크 통계 (공유 메모리에서 모은 뒤 그룹당 global atomic 으로 기록)
+groupshared uint gsEnemyCount;
+groupshared uint gsEnemySumX;
+groupshared uint gsEnemySumY;
+groupshared uint gsMaxX;
+groupshared uint gsMaxY;
+groupshared uint gsMaxInvX;
+groupshared uint gsMaxInvY;
+
 [numthreads(16, 16, 1)]
-void main(uint3 dispatchThreadId : SV_DispatchThreadID)
+void main(uint3 dispatchThreadId : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
 {
     uint2 pixel = dispatchThreadId.xy;
-    if (any(pixel >= frameDim)) return;
     int2 p = int2(pixel);
     float2 uv = (float2(pixel) + 0.5f) * invFrameDim;
 
-    // ---- 중심 픽셀 색상 카테고리 기록 (스레드 (0,0) 만) ----
-    if (all(pixel == uint2(0u, 0u)))
+    // ---- 적 마스크 통계 (gEnemyStats 는 매 프레임 0 으로 초기화된다) ----
+    // 배리어 때문에 화면 밖 스레드도 여기까지는 함께 실행한 뒤 반환한다.
+    bool inside  = all(pixel < frameDim);
+    // 픽셀 태그는 TagPass 가 만들었다 (R-2.3). 적 마스크는 그 태그에서 나온다.
+    uint pixelTag = inside ? gTagIn[pixel] : 0u;
+    bool isEnemy = pixelTag == 1u;
+
+    if (groupIndex == 0u)
     {
-        int2 cp = int2(centerUV * float2(frameDim));
-        float3 cc = sampleAlbedo(cp);
-        uint cat = 0u;
-        if (isEnemyColor(cc))      cat = 1u;
-        else if (isItemColor(cc))  cat = 2u;
-        gCenterCategory[0] = cat;
+        gsEnemyCount = 0u;
+        gsEnemySumX  = 0u;
+        gsEnemySumY  = 0u;
+        gsMaxX       = 0u;
+        gsMaxY       = 0u;
+        gsMaxInvX    = 0u;
+        gsMaxInvY    = 0u;
     }
+    GroupMemoryBarrierWithGroupSync();
+    if (isEnemy)
+    {
+        InterlockedAdd(gsEnemyCount, 1u);
+        InterlockedAdd(gsEnemySumX, pixel.x);
+        InterlockedAdd(gsEnemySumY, pixel.y);
+        InterlockedMax(gsMaxX, pixel.x);
+        InterlockedMax(gsMaxY, pixel.y);
+        InterlockedMax(gsMaxInvX, frameDim.x - pixel.x);
+        InterlockedMax(gsMaxInvY, frameDim.y - pixel.y);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (groupIndex == 0u && gsEnemyCount > 0u)
+    {
+        InterlockedAdd(gEnemyStats[0], gsEnemyCount);
+        InterlockedAdd(gEnemyStats[1], gsEnemySumX);
+        InterlockedAdd(gEnemyStats[2], gsEnemySumY);
+        InterlockedMax(gEnemyStats[4], gsMaxX);
+        InterlockedMax(gEnemyStats[5], gsMaxY);
+        InterlockedMax(gEnemyStats[6], gsMaxInvX);
+        InterlockedMax(gEnemyStats[7], gsMaxInvY);
+    }
+    if (!inside) return;
+    if (all(pixel == uint2(centerUV * float2(frameDim))))
+        gEnemyStats[3] = isEnemy ? 1u : 0u;
 
     // =========================================================
     // 1단계 (1): Image-space max-variance importance
@@ -278,21 +356,10 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
     // =========================================================
     float taskImp = 0.f;
 
-    if (activeTask == 1u) // Aiming: 붉은색(적) 픽셀에 높은 중요도
-    {
-        float3 albedo = sampleAlbedo(p);
-        if (isEnemyColor(albedo)) taskImp = taskImportance;
-    }
-    else if (activeTask == 2u) // Pointing: 녹색(아이템) 픽셀에 높은 중요도
-    {
-        float3 albedo = sampleAlbedo(p);
-        if (isItemColor(albedo)) taskImp = taskImportance;
-    }
-    else if (activeTask == 3u) // Steering: lower screen region
-    {
-        bool steerRegion = (uv.y > steerFloorY);
-        if (steerRegion) taskImp = taskImportance;
-    }
+    // task ROI 템플릿 (R-5.1) 과 적 영역 (R-5.3): I = max(I_task, α · I_enemy)
+    float taskRoi = inTaskRoi(uv, pixelTag) ? taskImportance : 0.f;
+    float enemyTerm = enemyAlpha * gEnemyRoi[pixel];
+    taskImp = max(taskRoi, enemyTerm);
 
     // ---- max(image, task) ----
     float importance = max(imageImp, taskImp);
@@ -345,9 +412,8 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
         if (debugView == 1u) // task overlay: 히트맵 위에 태스크 tint 를 혼합
         {
             float3 tint = float3(1.f, 1.f, 1.f);
-            if      (activeTask == 1u) tint = float3(1.0f, 0.2f, 0.2f); // Aim: red
-            else if (activeTask == 2u) tint = float3(0.2f, 1.0f, 0.4f); // Point: green
-            else if (activeTask == 3u) tint = float3(0.3f, 0.6f, 1.0f); // Steer: blue
+            if      (activeTask == 3u || activeTask == 4u) tint = float3(1.0f, 0.2f, 0.2f); // Track/Flick: red
+            else if (activeTask == 2u) tint = float3(0.3f, 0.6f, 1.0f); // Traverse: blue
             col = lerp(col, tint, taskImp * 0.7f);
         }
         gImportanceVis[pixel] = float4(col, 1.f);

@@ -47,6 +47,12 @@ target_sources(FalcorTest PRIVATE
     Tests/DiffRendering/Material/DiffMaterialTests.cpp
     Tests/DiffRendering/Material/DiffMaterialTests.cs.slang
 
+    Tests/MyTest/EnemyFieldTests.cpp
+    Tests/MyTest/SppAllocationTests.cpp
+    Tests/MyTest/TagMappingTests.cpp
+    Tests/MyTest/TaskClassifierTests.cpp
+    Tests/MyTest/TaskRoiTests.cpp
+
     Tests/Platform/LockFileTests.cpp
     Tests/Platform/MemoryMappedFileTests.cpp
     Tests/Platform/MonitorInfoTests.cpp
@@ -177,6 +183,9 @@ target_sources(FalcorTest PRIVATE
     Tests/Utils/VectorTests.cpp
 )
 
+
+# 한국어 주석을 UTF-8 로 읽게 한다 (ImportancePass/CMakeLists.txt 와 같은 이유).
+set_source_files_properties(Tests/MyTest/TaskClassifierTests.cpp Tests/MyTest/TagMappingTests.cpp Tests/MyTest/TaskRoiTests.cpp Tests/MyTest/EnemyFieldTests.cpp Tests/MyTest/SppAllocationTests.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
 
 target_link_libraries(FalcorTest PRIVATE args)
 

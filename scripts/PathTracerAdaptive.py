@@ -71,6 +71,7 @@ def render_graph_AdaptivePathTracer():
     g.addEdge("GBufferRT.linearZ",        "ImportancePass.linearZ")
     g.addEdge("GBufferRT.metalness",      "ImportancePass.metalness")
     g.addEdge("GBufferRT.specRough",      "ImportancePass.specRough")
+    g.addEdge("GBufferRT.objectID",       "ImportancePass.objectID")   # 태그 식별 (spec_TSK R-2.3)
 
     g.addEdge("ImportancePass.importance",  "SampleCountPass.importance")
     g.addEdge("SampleCountPass.sampleCount", "PathTracer.sampleCount")

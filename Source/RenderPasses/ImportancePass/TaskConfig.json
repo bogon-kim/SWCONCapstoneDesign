@@ -1,0 +1,37 @@
+{
+    "identifyMode": "tag",
+    "enemyRoi": {
+        "sigmaRatio": 0.01,
+        "alphaMax": 0.4,
+        "rampSec": 0.2
+    },
+    "tags": {
+        "Enemy": ["Enemy"],
+        "Item": ["Item"],
+        "Wall": ["Wall"],
+        "Floor": ["Floor"]
+    },
+    "enemy": {
+        "redThreshold": 0.55,
+        "redDominance": 0.9,
+        "greenMaxRatio": 0.4,
+        "minPixels": 20,
+        "centroidEmaAlpha": 0.5
+    },
+    "task": {
+        "omegaScan": 30.0,
+        "omegaFlick": 150.0,
+        "omegaFlickExit": 60.0,
+        "k": 50.0,
+        "thetaTrack": 3.0,
+        "thetaTrackFire": 6.0,
+        "thetaTrackExitMargin": 2.0,
+        "vMove": 0.5,
+        "phiHead": 30.0,
+        "minHoldSec": 0.15
+    },
+    "fire": {
+        "chunkGapSec": 1.0,
+        "recentWindowSec": 1.0
+    }
+}
