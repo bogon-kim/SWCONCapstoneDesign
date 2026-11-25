@@ -185,6 +185,18 @@ namespace Falcor
         */
         void resetInputState() override;
 
+        /** Select the custom (modified) controller behavior (true) or the original Falcor behavior (false, default).
+            Original: left-drag rotates, speed modifiers 1 / 0.25 (Ctrl) / 10 (Shift), movement along the full view direction and camera up.
+            Custom: mouse movement rotates without a button, rotation scaled by the mouse sensitivity,
+                    speed modifiers 2 / 0.25 (Ctrl) / 6 (Shift), movement flattened to the XZ plane (camera y is kept fixed).
+        */
+        void setUseCustomBehavior(bool useCustom) { mUseCustomBehavior = useCustom; mHasMousePos = false; }
+        bool getUseCustomBehavior() const { return mUseCustomBehavior; }
+
+        /** Mouse rotation sensitivity used in the custom behavior (scale applied to the normalized mouse delta).
+        */
+        void setMouseSensitivity(float sensitivity) { mMouseSensitivity = sensitivity; }
+
     private:
         bool mIsLeftButtonDown = false;
         bool mIsRightButtonDown = false;
@@ -215,6 +227,9 @@ namespace Falcor
         std::bitset<Direction::Count> mMovement;
 
         float mSpeedModifier = 1.0f;
+        bool mUseCustomBehavior = true;
+        float mMouseSensitivity = 2.0f;
+        bool mHasMousePos = false;
     };
 
     using FirstPersonCameraController = FirstPersonCameraControllerCommon<false>;

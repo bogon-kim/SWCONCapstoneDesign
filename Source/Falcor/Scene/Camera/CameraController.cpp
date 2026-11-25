@@ -46,6 +46,14 @@ namespace Falcor
             float2 res = (pos * scale) + offset;
             return res;
         }
+
+        // Keep only the horizontal part and normalize it. Returns a zero vector when the horizontal part is ~0 (looking straight up/down) to avoid NaN.
+        float3 flatDirection(const float3 v)
+        {
+            float3 flat = float3(v.x, 0.f, v.z);
+            float len = length(flat);
+            return len > 1e-5f ? flat * (1.f / len) : float3(0.f);
+        }
     }
 
     float3 CameraController::getUpVector() const
@@ -185,9 +193,9 @@ namespace Falcor
             }
 
             // 카메라 속도 조절
-            mSpeedModifier = 2.0f;
+            mSpeedModifier = mUseCustomBehavior ? 2.0f : 1.0f;
             if (event.hasModifier(Input::Modifier::Ctrl)) mSpeedModifier = 0.25f;
-            else if (event.hasModifier(Input::Modifier::Shift)) mSpeedModifier = 6.0f;
+            else if (event.hasModifier(Input::Modifier::Shift)) mSpeedModifier = mUseCustomBehavior ? 6.0f : 10.0f;
         }
 
         return handled;
@@ -257,11 +265,13 @@ namespace Falcor
 
                 float3 viewDir = normalize(camTarget - camPos);
 
-                if (mIsLeftButtonDown || anyGamepadRotation)
+                if (mUseCustomBehavior || mIsLeftButtonDown || anyGamepadRotation)
                 {
                     float3 sideway = cross(viewDir, normalize(camUp));
 
-                    float2 mouseRotation = mIsLeftButtonDown ? mMouseDelta * mSpeedModifier : float2(0.f);
+                    float2 mouseRotation(0.f);
+                    if (mUseCustomBehavior) mouseRotation = mMouseDelta * mMouseSensitivity;
+                    else if (mIsLeftButtonDown) mouseRotation = mMouseDelta * mSpeedModifier;
                     float2 gamepadRotation = anyGamepadRotation ? mGamepadRightStick * kGamepadRotationSpeed * elapsedTime : float2(0.f);
                     float2 rotation = mouseRotation + gamepadRotation;
 
@@ -292,6 +302,7 @@ namespace Falcor
                 }
 
                 mShouldRotate = false;
+                mMouseDelta = float2(0.f);
             }
 
             if (mMovement.any() || anyGamepadMovement)
@@ -319,17 +330,25 @@ namespace Falcor
                 float3 viewDir = normalize(camTarget - camPos);
                 float3 sideway = cross(viewDir, normalize(camUp));
 
-                // 카메라가 위아래로 움직이지 않도록 Y성분 제거
-                float3 flatViewDir = normalize(float3(viewDir.x, 0.f, viewDir.z)); 
-                float3 flatSideway = normalize(float3(sideway.x, 0.f, sideway.z)); 
-
+                const float startY = camPos.y;
                 float curMove = mSpeedModifier * mSpeed * elapsedTime;
-                camPos += movement.z * curMove * flatViewDir; // viewDir → flatViewDir
-                camPos += movement.x * curMove * flatSideway; // sideway → flatSideway
-                // camPos += movement.y * curMove * camUp;
+                if (!mUseCustomBehavior)
+                {
+                    camPos += movement.z * curMove * viewDir;
+                    camPos += movement.x * curMove * sideway;
+                    camPos += movement.y * curMove * camUp;
+                }
+                else
+                {
+                    // Move only horizontally regardless of view direction. Camera y is restored after clamping.
+                    camPos += movement.z * curMove * flatDirection(viewDir);
+                    camPos += movement.x * curMove * flatDirection(sideway);
+                }
 
                 if (mBounds.valid())
                     camPos = clamp(camPos, mBounds.minPoint, mBounds.maxPoint);
+                if (mUseCustomBehavior)
+                    camPos.y = startY;
 
                 camTarget = camPos + viewDir;
 
@@ -378,7 +397,19 @@ namespace Falcor
             }
             break;
         case MouseEvent::Type::Move:
-            if(mIsLeftButtonDown || mIsRightButtonDown)
+            if (mUseCustomBehavior)
+            {
+                // Rotate on any mouse movement, no button needed. The first event only sets the reference point. Deltas accumulate within a frame.
+                if (mHasMousePos)
+                {
+                    mMouseDelta = mMouseDelta + (event.pos - mLastMousePos);
+                    mShouldRotate = true;
+                }
+                mLastMousePos = event.pos;
+                mHasMousePos = true;
+                handled = true;
+            }
+            else if(mIsLeftButtonDown || mIsRightButtonDown)
             {
                 mMouseDelta = event.pos - mLastMousePos;
                 mLastMousePos = event.pos;
@@ -399,6 +430,7 @@ namespace Falcor
         mIsLeftButtonDown   = false;
         mIsRightButtonDown  = false;
         mShouldRotate       = false;
+        mHasMousePos        = false;
         mMovement.reset();
 
         mGamepadLeftStick       = float2(0.f);

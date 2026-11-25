@@ -519,6 +519,10 @@ namespace Falcor
         */
         CameraControllerType getCameraControllerType() const { return mCamCtrlType; }
 
+        /** Get the active camera controller (may be null before the scene is set up).
+        */
+        CameraController* getCameraController() const { return mpCamCtrl.get(); }
+
         /** Reset the currently selected camera.
             This function will place the camera at the center of scene and optionally set the depth range to some reasonable pre-determined values
         */
