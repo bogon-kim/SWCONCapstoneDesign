@@ -110,6 +110,7 @@ RenderPassReflection SampleCountPass::reflect(const CompileData& compileData)
 
 void SampleCountPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    FALCOR_PROFILE(pRenderContext, "SampleCountPass");
     ref<Texture> pImportance     = renderData.getTexture(kInputImportance);
     ref<Texture> pOutput         = renderData.getTexture(kOutputSampleCount);
     ref<Texture> pSampleCountVis = renderData.getTexture(kOutputSampleCountVis);
@@ -132,6 +133,7 @@ void SampleCountPass::execute(RenderContext* pRenderContext, const RenderData& r
 
     // ---- 1) 가중치 히스토그램 ----
     {
+        FALCOR_PROFILE(pRenderContext, "SampleCountPass/Hist");
         auto var = mpHistPass->getRootVar();
         var["CB"].setBlob(&cb, sizeof(cb));
         var["gImportance"] = pImportance;
@@ -142,6 +144,7 @@ void SampleCountPass::execute(RenderContext* pRenderContext, const RenderData& r
 
     // ---- 2) s 찾기 (1 스레드) ----
     {
+        FALCOR_PROFILE(pRenderContext, "SampleCountPass/Solve");
         auto var = mpSolvePass->getRootVar();
         var["CB"].setBlob(&cb, sizeof(cb));
         var["gHist"]  = mpHist;
@@ -152,6 +155,7 @@ void SampleCountPass::execute(RenderContext* pRenderContext, const RenderData& r
 
     // ---- 3) 정수 부분 base 와 소수 부분 히스토그램 ----
     {
+        FALCOR_PROFILE(pRenderContext, "SampleCountPass/Base");
         auto var = mpBasePass->getRootVar();
         var["CB"].setBlob(&cb, sizeof(cb));
         var["gImportance"] = pImportance;
@@ -165,6 +169,7 @@ void SampleCountPass::execute(RenderContext* pRenderContext, const RenderData& r
 
     // ---- 4) 보정 기준 (1 스레드) ----
     {
+        FALCOR_PROFILE(pRenderContext, "SampleCountPass/Delta");
         auto var = mpDeltaPass->getRootVar();
         var["CB"].setBlob(&cb, sizeof(cb));
         var["gHist"]  = mpHist;
@@ -176,6 +181,7 @@ void SampleCountPass::execute(RenderContext* pRenderContext, const RenderData& r
     // ---- 5) 최종 spp ----
     mpFinalPass->getProgram()->addDefine("HAS_SAMPLE_COUNT_VIS", pSampleCountVis ? "1" : "0");
     {
+        FALCOR_PROFILE(pRenderContext, "SampleCountPass/Final");
         auto var = mpFinalPass->getRootVar();
         var["CB"].setBlob(&cb, sizeof(cb));
         var["gImportance"]     = pImportance;

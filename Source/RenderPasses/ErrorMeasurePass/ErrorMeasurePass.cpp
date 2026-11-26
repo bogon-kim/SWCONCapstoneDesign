@@ -147,6 +147,7 @@ RenderPassReflection ErrorMeasurePass::reflect(const CompileData& compileData)
 
 void ErrorMeasurePass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    FALCOR_PROFILE(pRenderContext, "ErrorMeasure");
     ref<Texture> pSourceImageTexture = renderData.getTexture(kInputChannelSourceImage);
     ref<Texture> pOutputImageTexture = renderData.getTexture(kOutputChannelImage);
 
@@ -220,6 +221,7 @@ void ErrorMeasurePass::execute(RenderContext* pRenderContext, const RenderData& 
 
 void ErrorMeasurePass::runDifferencePass(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    FALCOR_PROFILE(pRenderContext, "ErrorMeasure/Difference");
     // Bind textures.
     ref<Texture> pSourceTexture = renderData.getTexture(kInputChannelSourceImage);
 
@@ -246,6 +248,7 @@ void ErrorMeasurePass::runDifferencePass(RenderContext* pRenderContext, const Re
 
 void ErrorMeasurePass::runReductionPasses(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    FALCOR_PROFILE(pRenderContext, "ErrorMeasure/Reduction");
     float4 error;
     mpParallelReduction->execute(pRenderContext, mpDifferenceTexture, ParallelReduction::Type::Sum, &error);
 

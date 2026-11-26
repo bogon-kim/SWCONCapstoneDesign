@@ -175,6 +175,7 @@ void SVGFPass::compile(RenderContext* pRenderContext, const CompileData& compile
 
 void SVGFPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    FALCOR_PROFILE(pRenderContext, "SVGF");
     ref<Texture> pAlbedoTexture = renderData.getTexture(kInputBufferAlbedo);
     ref<Texture> pColorTexture = renderData.getTexture(kInputBufferColor);
     ref<Texture> pEmissionTexture = renderData.getTexture(kInputBufferEmission);
@@ -209,40 +210,55 @@ void SVGFPass::execute(RenderContext* pRenderContext, const RenderData& renderDa
     {
         // Grab linear z and its derivative and also pack the normal into
         // the last two channels of the mpLinearZAndNormalFbo.
-        computeLinearZAndNormal(pRenderContext, pLinearZTexture, pWorldNormalTexture);
+        {
+            FALCOR_PROFILE(pRenderContext, "SVGF/LinearZ");
+            computeLinearZAndNormal(pRenderContext, pLinearZTexture, pWorldNormalTexture);
+        }
 
         // Demodulate input color & albedo to get illumination and lerp in
         // reprojected filtered illumination from the previous frame.
         // Stores the result as well as initial moments and an updated
         // per-pixel history length in mpCurReprojFbo.
         ref<Texture> pPrevLinearZAndNormalTexture = renderData.getTexture(kInternalBufferPreviousLinearZAndNormal);
-        computeReprojection(
-            pRenderContext,
-            pAlbedoTexture,
-            pColorTexture,
-            pEmissionTexture,
-            pMotionVectorTexture,
-            pPosNormalFwidthTexture,
-            pPrevLinearZAndNormalTexture
-        );
+        {
+            FALCOR_PROFILE(pRenderContext, "SVGF/Reprojection");
+            computeReprojection(
+                pRenderContext,
+                pAlbedoTexture,
+                pColorTexture,
+                pEmissionTexture,
+                pMotionVectorTexture,
+                pPosNormalFwidthTexture,
+                pPrevLinearZAndNormalTexture
+            );
+        }
 
         // Do a first cross-bilateral filtering of the illumination and
         // estimate its variance, storing the result into a float4 in
         // mpPingPongFbo[0].  Takes mpCurReprojFbo as input.
-        computeFilteredMoments(pRenderContext);
+        {
+            FALCOR_PROFILE(pRenderContext, "SVGF/FilteredMoments");
+            computeFilteredMoments(pRenderContext);
+        }
 
         // Filter illumination from mpCurReprojFbo[0], storing the result
         // in mpPingPongFbo[0].  Along the way (or at the end, depending on
         // the value of mFeedbackTap), save the filtered illumination for
         // next time into mpFilteredPastFbo.
-        computeAtrousDecomposition(pRenderContext, pAlbedoTexture);
+        {
+            FALCOR_PROFILE(pRenderContext, "SVGF/Atrous");
+            computeAtrousDecomposition(pRenderContext, pAlbedoTexture);
+        }
 
         // Compute albedo * filtered illumination and add emission back in.
         auto perImageCB = mpFinalModulate->getRootVar()["PerImageCB"];
         perImageCB["gAlbedo"] = pAlbedoTexture;
         perImageCB["gEmission"] = pEmissionTexture;
         perImageCB["gIllumination"] = mpPingPongFbo[0]->getColorTexture(0);
-        mpFinalModulate->execute(pRenderContext, mpFinalFbo);
+        {
+            FALCOR_PROFILE(pRenderContext, "SVGF/Modulate");
+            mpFinalModulate->execute(pRenderContext, mpFinalFbo);
+        }
 
         // Blit into the output texture.
         pRenderContext->blit(mpFinalFbo->getColorTexture(0)->getSRV(), pOutputTexture->getRTV());

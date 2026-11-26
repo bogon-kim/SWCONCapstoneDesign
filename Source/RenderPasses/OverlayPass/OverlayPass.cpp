@@ -65,6 +65,7 @@ RenderPassReflection OverlayPass::reflect(const CompileData& compileData)
 
 void OverlayPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    FALCOR_PROFILE(pRenderContext, "Overlay");
     // 입력을 출력으로 그대로 복사 (크로스헤어는 renderOverlayUI에서 ImGui로 그림)
     auto src = renderData.getTexture(kInputChannels[0].name);
     auto dst = renderData.getTexture(kOutputChannels[0].name);

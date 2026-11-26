@@ -370,6 +370,7 @@ void ImportancePass::issueEnemyReadback(RenderContext* pRenderContext, uint32_t 
 // ---------------------------------------------------------------------------
 void ImportancePass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    FALCOR_PROFILE(pRenderContext, "ImportancePass");
     // Delta-time
     const auto now = std::chrono::steady_clock::now();
     if (mFirstTick) mStartTick = now;
@@ -446,6 +447,7 @@ void ImportancePass::execute(RenderContext* pRenderContext, const RenderData& re
     // ---- 1) 태그 맵 (R-2.3). 메인 패스와 적 영역 맵이 이 결과를 읽는다 ----
     ensureFieldTextures(w, h);
     {
+        FALCOR_PROFILE(pRenderContext, "ImportancePass/Tag");
         auto tagVar = mpTagPass->getRootVar();
         tagVar["CB"].setBlob(&mCB, sizeof(mCB));
         tagVar["gDiffuseOpacity"] = renderData.getTexture(kInDiffuseOpacity);
@@ -470,6 +472,7 @@ void ImportancePass::execute(RenderContext* pRenderContext, const RenderData& re
     fieldCB.frameDim[1] = h;
     fieldCB.sigmaPx     = sigma;
     {
+        FALCOR_PROFILE(pRenderContext, "ImportancePass/JFA_init");
         auto initVar = mpFieldInitPass->getRootVar();
         initVar["FieldCB"].setBlob(&fieldCB, sizeof(fieldCB));
         initVar["gTagIn"]   = mpTagMap;
@@ -481,6 +484,7 @@ void ImportancePass::execute(RenderContext* pRenderContext, const RenderData& re
     ref<Texture> pSeedIn = mpSeedA, pSeedOut = mpSeedB;
     for (const uint32_t step : jfaSteps(sigma))
     {
+        FALCOR_PROFILE(pRenderContext, fmt::format("ImportancePass/JFA_step_{}", step));
         ref<ComputePass> pStep = getJfaStepPass(step);
         auto stepVar = pStep->getRootVar();
         stepVar["FieldCB"].setBlob(&fieldCB, sizeof(fieldCB));
@@ -492,6 +496,7 @@ void ImportancePass::execute(RenderContext* pRenderContext, const RenderData& re
         std::swap(pSeedIn, pSeedOut);
     }
     {
+        FALCOR_PROFILE(pRenderContext, "ImportancePass/JFA_final");
         auto finalVar = mpFieldFinalPass->getRootVar();
         finalVar["FieldCB"].setBlob(&fieldCB, sizeof(fieldCB));
         finalVar["gTagIn"]   = mpTagMap;
@@ -542,11 +547,17 @@ void ImportancePass::execute(RenderContext* pRenderContext, const RenderData& re
     mpComputePass->getProgram()->addDefines(defines);
 
     // Dispatch
-    pRenderContext->clearUAV(mpEnemyStatsBuf->getUAV().get(), uint4(0));
-    mpComputePass->execute(pRenderContext, w, h);
+    {
+        FALCOR_PROFILE(pRenderContext, "ImportancePass/Main");
+        pRenderContext->clearUAV(mpEnemyStatsBuf->getUAV().get(), uint4(0));
+        mpComputePass->execute(pRenderContext, w, h);
+    }
 
     // 적 통계를 비동기 readback 으로 넘긴다
-    issueEnemyReadback(pRenderContext, w, h, time);
+    {
+        FALCOR_PROFILE(pRenderContext, "ImportancePass/ReadbackIssue");
+        issueEnemyReadback(pRenderContext, w, h, time);
+    }
     mFrame++;
 }
 

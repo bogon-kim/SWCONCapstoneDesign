@@ -107,6 +107,7 @@ RenderPassReflection GBufferRT::reflect(const CompileData& compileData)
 
 void GBufferRT::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    FALCOR_PROFILE(pRenderContext, "GBufferRT");
     GBuffer::execute(pRenderContext, renderData);
 
     // Update frame dimension based on render pass output.
@@ -153,7 +154,10 @@ void GBufferRT::execute(RenderContext* pRenderContext, const RenderData& renderD
         renderData.getDictionary()[Falcor::kRenderPassPRNGDimension] = mComputeDOF ? 2u : 0u;
     }
 
-    mUseTraceRayInline ? executeCompute(pRenderContext, renderData) : executeRaytrace(pRenderContext, renderData);
+    {
+        FALCOR_PROFILE(pRenderContext, "GBufferRT/Trace");
+        mUseTraceRayInline ? executeCompute(pRenderContext, renderData) : executeRaytrace(pRenderContext, renderData);
+    }
 
     mFrameCount++;
 }
